@@ -25,12 +25,16 @@ const PALETTES: [tailwind::Palette; 4] = [
     tailwind::INDIGO,
     tailwind::RED,
 ];
-const INFO_TEXT: [&str; 2] = [
+const INFO_TEXT_SIZE: usize = 3;
+const INFO_TEXT: [&str; INFO_TEXT_SIZE] = [
     "(Esc) quit | (↑) move up | (↓) move down | (←) move left | (→) move right",
+    "(PgUp) page up | (PgDn) page down | (Home) move to start | (End) move to end",
     "(Shift + →) next color | (Shift + ←) previous color",
 ];
 
 const ITEM_HEIGHT: usize = 4;
+const LIST_SIZE: usize = 20;
+const FOOTER_LENGTH: u16 = INFO_TEXT_SIZE as u16 + 2; // top and bottom border
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -97,6 +101,7 @@ struct App {
     scroll_state: ScrollbarState,
     colors: TableColors,
     color_index: usize,
+    rows_per_page: Option<usize>,
 }
 
 impl App {
@@ -105,14 +110,37 @@ impl App {
         Self {
             state: TableState::default().with_selected(0),
             longest_item_lens: constraint_len_calculator(&data_vec),
-            scroll_state: ScrollbarState::new((data_vec.len() - 1) * ITEM_HEIGHT),
+            scroll_state: ScrollbarState::new((data_vec.len().saturating_sub(1)) * ITEM_HEIGHT),
             colors: TableColors::new(&PALETTES[0]),
             color_index: 0,
             items: data_vec,
+            rows_per_page: None,
         }
     }
 
+    pub const fn update_row_state(&mut self, i: usize) {
+        self.state.select(Some(i));
+        self.scroll_state = self.scroll_state.position(i * ITEM_HEIGHT);
+    }
+
+    pub const fn first_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.update_row_state(0);
+    }
+
+    pub const fn last_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.update_row_state(self.items.len() - 1);
+    }
+
     pub const fn next_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
         let i = match self.state.selected() {
             Some(i) => {
                 if i >= self.items.len() - 1 {
@@ -123,11 +151,13 @@ impl App {
             }
             None => 0,
         };
-        self.state.select(Some(i));
-        self.scroll_state = self.scroll_state.position(i * ITEM_HEIGHT);
+        self.update_row_state(i);
     }
 
     pub const fn previous_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
         let i = match self.state.selected() {
             Some(i) => {
                 if i == 0 {
@@ -138,8 +168,41 @@ impl App {
             }
             None => 0,
         };
-        self.state.select(Some(i));
-        self.scroll_state = self.scroll_state.position(i * ITEM_HEIGHT);
+        self.update_row_state(i);
+    }
+
+    pub const fn page_down_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let Some(rows_per_page) = self.rows_per_page else {
+            return;
+        };
+        // page the viewport from the current offset, not the selected row: the
+        // selection can sit mid-viewport after arrow-key navigation, and paging
+        // from it would scroll by more than one page
+        let i = self.state.offset() + rows_per_page;
+        let max = self.items.len() - 1;
+        let i = if i > max { max } else { i };
+        self.update_row_state(i);
+        // scroll the viewport by a full page, but keep it filled at the end of the
+        // list: setting the offset to the selection would leave blank rows below the
+        // last item when paging to the end
+        let max_offset = self.items.len().saturating_sub(rows_per_page);
+        *self.state.offset_mut() = if i > max_offset { max_offset } else { i };
+    }
+
+    pub const fn page_up_row(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let Some(rows_per_page) = self.rows_per_page else {
+            return;
+        };
+        // page the viewport from the current offset, not the selected row
+        let i = self.state.offset().saturating_sub(rows_per_page);
+        self.update_row_state(i);
+        *self.state.offset_mut() = i;
     }
 
     pub fn next_column(&mut self) {
@@ -173,6 +236,10 @@ impl App {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('j') | KeyCode::Down => self.next_row(),
                     KeyCode::Char('k') | KeyCode::Up => self.previous_row(),
+                    KeyCode::Char('g') | KeyCode::Home => self.first_row(),
+                    KeyCode::Char('G') | KeyCode::End => self.last_row(),
+                    KeyCode::Char('d') | KeyCode::PageDown => self.page_down_row(),
+                    KeyCode::Char('u') | KeyCode::PageUp => self.page_up_row(),
                     KeyCode::Char('L') | KeyCode::Right if shift_pressed => self.next_color(),
                     KeyCode::Char('H') | KeyCode::Left if shift_pressed => {
                         self.previous_color();
@@ -186,8 +253,17 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let layout = Layout::vertical([Constraint::Min(5), Constraint::Length(4)]);
+        let layout = Layout::vertical([Constraint::Min(5), Constraint::Length(FOOTER_LENGTH)]);
         let rects = frame.area().layout_vec(&layout);
+        let rows_per_page = ((rects[0].height.saturating_sub(1)) / ITEM_HEIGHT as u16) as usize;
+        // after shrinking the window, the offset may have been pushed to the end of the
+        // list to keep the selection visible; regrowing would then leave blank rows below
+        // the last item, so clamp the offset back to the start of the last page
+        let max_offset = self.items.len().saturating_sub(rows_per_page);
+        if self.state.offset() > max_offset {
+            *self.state.offset_mut() = max_offset;
+        }
+        self.rows_per_page = Some(rows_per_page);
 
         self.set_colors();
 
@@ -298,7 +374,7 @@ impl App {
 fn generate_fake_names() -> Vec<Data> {
     use fakeit::{address, contact, name};
 
-    (0..20)
+    (0..LIST_SIZE)
         .map(|_| {
             let name = name::full();
             let address = format!(
@@ -347,7 +423,9 @@ fn constraint_len_calculator(items: &[Data]) -> (u16, u16, u16) {
 
 #[cfg(test)]
 mod tests {
-    use crate::Data;
+    use crate::{Data, FOOTER_LENGTH, ITEM_HEIGHT, LIST_SIZE};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn constraint_len_calculator() {
@@ -370,5 +448,93 @@ mod tests {
         assert_eq!(26, longest_name_len);
         assert_eq!(33, longest_address_len);
         assert_eq!(40, longest_email_len);
+    }
+
+    #[test]
+    fn resize_clamps_offset_to_fill_viewport() {
+        let mut app = crate::App::new();
+        let list_size = LIST_SIZE;
+        let item_height = ITEM_HEIGHT as u16;
+
+        let big_visible_rows = 9;
+        let small_visible_rows = 5;
+        // terminal heights derived from the same formula as render():
+        //   rows_per_page = (height - FOOTER_LENGTH - 1) / item_height
+        //   →  height = rows_per_page * item_height + 1 + FOOTER_LENGTH
+        let big_height = big_visible_rows * item_height + 1 + FOOTER_LENGTH; // 42
+        let small_height = small_visible_rows * item_height + 1 + FOOTER_LENGTH; // 26
+        let big_rows_per_page = big_visible_rows as usize;
+        let small_rows_per_page = small_visible_rows as usize;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, big_height)).unwrap();
+
+        // first render to set rows_per_page
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // page down to the end: ceil((list_size - 1) / rows_per_page) pages
+        // 0 → 9 (offset 9), 9 → 18 (offset 11), 18 → 19 (offset 11)
+        let page_down_count = (list_size - 1).div_ceil(big_rows_per_page);
+        for _ in 0..page_down_count {
+            app.page_down_row();
+        }
+
+        assert_eq!(app.state.selected(), Some(list_size - 1));
+        assert_eq!(app.state.offset(), list_size - big_rows_per_page);
+
+        // shrink: visible_rows pushes offset to keep selected=19 in view
+        terminal = Terminal::new(TestBackend::new(80, small_height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        // visible_rows moves offset to list_size - small_rows_per_page so that
+        // the last row sits at the bottom of the viewport
+        assert_eq!(app.state.offset(), list_size - small_rows_per_page);
+
+        // regrow: clamp pulls offset back to list_size - big_rows_per_page
+        // (the viewport would otherwise start at the old offset and leave blank
+        // rows below the last item)
+        terminal = Terminal::new(TestBackend::new(80, big_height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.state.offset(), list_size - big_rows_per_page);
+        assert_eq!(app.state.selected(), Some(list_size - 1));
+    }
+
+    #[test]
+    fn page_down_scrolls_by_one_page_from_the_viewport_offset() {
+        let mut app = crate::App::new();
+        let big_height = 9 * ITEM_HEIGHT as u16 + 1 + FOOTER_LENGTH;
+        let mut terminal = Terminal::new(TestBackend::new(80, big_height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // arrow down: selection moves into the middle of the first page
+        app.next_row();
+        app.next_row();
+        app.next_row();
+        assert_eq!(app.state.selected(), Some(3));
+        assert_eq!(app.state.offset(), 0);
+
+        // paging advances the viewport by exactly one page from the offset, not
+        // from the selected row
+        app.page_down_row();
+        assert_eq!(app.state.selected(), Some(9));
+        assert_eq!(app.state.offset(), 9);
+    }
+
+    #[test]
+    fn page_up_scrolls_back_one_page_from_the_viewport_offset() {
+        let mut app = crate::App::new();
+        let big_height = 9 * ITEM_HEIGHT as u16 + 1 + FOOTER_LENGTH;
+        let mut terminal = Terminal::new(TestBackend::new(80, big_height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // page down once, then arrow down into the middle of the second page
+        app.page_down_row();
+        app.next_row();
+        assert_eq!(app.state.selected(), Some(10));
+        assert_eq!(app.state.offset(), 9);
+
+        // paging up returns to the previous page and anchors the selection at
+        // its top
+        app.page_up_row();
+        assert_eq!(app.state.selected(), Some(0));
+        assert_eq!(app.state.offset(), 0);
     }
 }
