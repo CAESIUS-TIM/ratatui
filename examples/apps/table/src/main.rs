@@ -33,7 +33,7 @@ const INFO_TEXT: [&str; INFO_TEXT_SIZE] = [
 ];
 
 const ITEM_HEIGHT: usize = 4;
-const LIST_SIZE: usize = 20;
+const LIST_SIZE: usize = 100;
 const FOOTER_LENGTH: u16 = INFO_TEXT_SIZE as u16 + 2; // top and bottom border
 
 fn main() -> Result<()> {
@@ -341,11 +341,22 @@ impl App {
     }
 
     fn render_scrollbar(&mut self, frame: &mut Frame, area: Rect) {
+        // Break the selected-row highlight (REVERSED + fg) from leaking into the
+        // scrollbar: Cell::set_style patches rather than replaces, so unspecified
+        // fields would keep the values written by the table.
+        let track_style = Style::new()
+            .fg(self.colors.row_fg)
+            .remove_modifier(Modifier::REVERSED);
+        let thumb_style = Style::new()
+            .fg(self.colors.row_fg)
+            .remove_modifier(Modifier::REVERSED);
         frame.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
-                .end_symbol(None),
+                .end_symbol(None)
+                .track_style(track_style)
+                .thumb_style(thumb_style),
             area.inner(Margin {
                 vertical: 1,
                 horizontal: 1,
@@ -426,6 +437,7 @@ mod tests {
     use crate::{Data, FOOTER_LENGTH, ITEM_HEIGHT, LIST_SIZE};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     #[test]
     fn constraint_len_calculator() {
@@ -536,5 +548,35 @@ mod tests {
         app.page_up_row();
         assert_eq!(app.state.selected(), Some(0));
         assert_eq!(app.state.offset(), 0);
+    }
+
+    #[test]
+    fn scrollbar_is_not_affected_by_row_highlight_style() {
+        let mut app = crate::App::new();
+        let height = 9 * ITEM_HEIGHT as u16 + 1 + FOOTER_LENGTH;
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap(); // App::new selects row 0
+
+        // The scrollbar renders in the main area .inner(Margin { vertical: 1,
+        // horizontal: 1 }); VerticalRight puts it in the rightmost column
+        // x = width - 2 (1 inner left margin plus the scrollbar's own width of 1)
+        let scrollbar_x = 80 - 2;
+        let table_area_height = height - FOOTER_LENGTH;
+        let buffer = terminal.backend().buffer();
+        for y in 1..(table_area_height - 1) {
+            let cell = &buffer[(scrollbar_x, y)];
+            if cell.symbol() != " " {
+                assert!(
+                    !cell.modifier.contains(Modifier::REVERSED),
+                    "scrollbar cell at ({scrollbar_x}, {y}) inherits REVERSED from table highlight"
+                );
+            }
+        }
+        // The thumb starts at the top of the track (position 0); its fg must be the
+        // thumb style, not the selected-row highlight fg
+        assert_eq!(
+            buffer[(scrollbar_x, 1)].fg,
+            app.colors.selected_row_style_fg
+        );
     }
 }
